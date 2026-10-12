@@ -47,7 +47,7 @@ import urllib.parse
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 import urllib3
@@ -483,9 +483,11 @@ def poll_acl_update(
     own_uuid: str,
     attempts: int = 30,
     interval: float = 3.0,
+    on_attempt: Callable[[int], None] | None = None,
 ) -> str | None:
     """Poll until an ACL-update addressed to ``own_uuid`` arrives.
 
+    ``on_attempt`` receives each 1-based attempt number before it runs.
     Returns the base64-decoded payload as text, or None on timeout.
     """
     _log(
@@ -499,6 +501,8 @@ def poll_acl_update(
     session, temps = _mtls_session(cert_pem, key_pem)
     try:
         for n in range(1, attempts + 1):
+            if on_attempt is not None:
+                on_attempt(n)
             try:
                 resp = session.get(
                     f"{portal_url}/event",
@@ -821,7 +825,8 @@ def gateway_local_info(
             info = {**info, "portalname": repair_utf8_mojibake(info["portalname"])}
         if "uuid" not in info:
             raise GatewayAdminError(
-                f"Gateway op=6 response missing uuid: {info!r}"
+                "Gateway op=6 response missing uuid "
+                f"(response keys: {sorted(info)}; values redacted)"
             )
         return info
     finally:

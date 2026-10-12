@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import socket
 
@@ -12,6 +13,7 @@ from homeassistant.config_entries import (
     ConfigFlowResult,
     OptionsFlow,
 )
+from homeassistant.const import __version__ as HA_VERSION
 from homeassistant.core import callback
 from homeassistant.helpers import selector
 from homeassistant.helpers.storage import Store
@@ -58,6 +60,7 @@ from .portal import (
     resolve_portal_url,
     send_connect_event,
 )
+from .pairing_report import PairingReport
 from .redaction import get_redacting_logger
 
 _LOGGER = get_redacting_logger(__name__)
@@ -187,12 +190,19 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
         self._integrity_display = ""
         self._doors: list[dict] = []
         self._manual_authorize = False
-        self._authorize_error_msg = ""
         self._gateway_profile = GATEWAY_PROFILE_WEB_ADMIN
         self._acl_timed_out = False
         self._pending_pairing_checked = False
         self._pending_pairing: dict[str, object] | None = None
         self._pending_pairing_phase = PENDING_PAIRING_PHASE_AWAITING_ACL
+        self._report: PairingReport | None = None
+        self._pairing_task: asyncio.Task[str] | None = None
+        self._pairing_stage = "gateway_uuid"
+        self._pairing_errors: dict[str, str] = {}
+        self._credentials_input: dict = {}
+        self._poll_task: asyncio.Task[str] | None = None
+        self._poll_attempt = 0
+        self._abort_reason = ""
 
     def _pending_store(self) -> Store[dict[str, object]]:
         """Return private storage for the single unfinished app pairing."""
@@ -359,6 +369,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Collect profile-specific credentials and start pairing."""
         errors: dict[str, str] = {}
+        debug_report = ""
         capabilities = GATEWAY_CAPABILITIES[self._gateway_profile]
 
         pending_result = await self._async_find_pending_pairing()
@@ -366,6 +377,9 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             return pending_result
 
         if user_input is not None:
+            # Errors found by the pairing progress step re-open this form, so
+            # keep what was typed for the next attempt.
+            self._credentials_input = dict(user_input)
             self._username = user_input[CONF_ABB_USERNAME].strip().lower()
             self._password = user_input[CONF_ABB_PASSWORD]
             self._gateway_ip = user_input[CONF_GATEWAY_IP].strip()
@@ -397,87 +411,27 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                     )
 
             if not errors:
-                # Phase 1: portal-side setup + send connect event to gateway.
-                # Errors here are unrecoverable (we never put a pending request
-                # on the gateway), so they go straight back to the form.
-                try:
-                    await self.hass.async_add_executor_job(self._do_pairing_setup)
-                except GatewayAdminError as err:
-                    msg = str(err).lower()
-                    if "login failed" in msg:
-                        errors["base"] = "gateway_admin_auth_failed"
-                    elif "missing uuid" in msg or "op=6" in msg:
-                        # Local op=6 lookup failed and user didn't supply an
-                        # override. Tell them how to recover.
-                        errors["base"] = "gateway_op6_failed"
-                    else:
-                        _log_error(
-                            "Gateway admin error during setup (details redacted)"
-                        )
-                        errors["base"] = "gateway_admin_failed"
-                except PortalError as err:
-                    msg = str(err).lower()
-                    if "401" in msg or "auth" in msg:
-                        errors["base"] = "invalid_auth"
-                    elif "no discovery" in msg or "gateway entry" in msg:
-                        errors["base"] = "gateway_not_found"
-                    else:
-                        _log_error("Portal pairing error (details redacted)")
-                        errors["base"] = "unknown"
-                except Exception:  # noqa: BLE001
-                    _LOGGER.error("Unexpected portal setup error (details redacted)")
-                    errors["base"] = "unknown"
-                else:
-                    if capabilities.approval_method == "automatic_acl":
-                        try:
-                            await self._async_save_pending_pairing()
-                        except Exception:  # noqa: BLE001
-                            _log_error(
-                                "Could not persist pending pairing state "
-                                "(details redacted)"
-                            )
-                            return self.async_abort(reason="pending_storage_failed")
-                        return await self.async_step_poll_acl()
-                    # Phase 2: auto-approve on the gateway. By this point the
-                    # connect event was successfully sent, so the gateway has
-                    # a pending request — recoverable via the manual UI even
-                    # if our CGI calls fail.
-                    try:
-                        await self.hass.async_add_executor_job(
-                            self._do_gateway_authorize
-                        )
-                    except GatewayAdminError as err:
-                        msg = str(err).lower()
-                        if "login failed" in msg:
-                            # Wrong admin password — manual flow can't recover.
-                            errors["base"] = "gateway_admin_auth_failed"
-                        else:
-                            _log_info(
-                                "Auto-approve failed (details redacted); offering "
-                                "manual approval via the gateway web UI"
-                            )
-                            self._manual_authorize = True
-                            self._authorize_error_msg = (
-                                "Gateway CGI approval failed; details are redacted"
-                            )
-                            return await self.async_step_manual_authorize()
-                    except Exception:  # noqa: BLE001
-                        _LOGGER.error(
-                            "Unexpected error during auto-approve (details redacted)"
-                        )
-                        errors["base"] = "unknown"
-                    else:
-                        return await self.async_step_poll_acl()
+                return await self.async_step_pairing()
+
+        elif self._pairing_errors:
+            errors, self._pairing_errors = self._pairing_errors, {}
+            debug_report = self._debug_report()
 
         return self.async_show_form(
             step_id="credentials",
-            data_schema=(
-                STEP_APP_MANAGED_DATA_SCHEMA
-                if not capabilities.admin_available
-                else STEP_WEB_ADMIN_DATA_SCHEMA
+            data_schema=self.add_suggested_values_to_schema(
+                (
+                    STEP_APP_MANAGED_DATA_SCHEMA
+                    if not capabilities.admin_available
+                    else STEP_WEB_ADMIN_DATA_SCHEMA
+                ),
+                self._credentials_input,
             ),
             errors=errors,
-            description_placeholders={"profile": self._gateway_profile},
+            description_placeholders={
+                "profile": self._gateway_profile,
+                "debug_report": debug_report,
+            },
         )
 
     async def async_step_pending_pairing(
@@ -518,7 +472,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                 await self._async_clear_pending_pairing()
             except Exception:  # noqa: BLE001
                 _log_error("Could not discard pending pairing state")
-                return self.async_abort(reason="pending_storage_failed")
+                return self._abort_with_report("pending_storage_failed")
             self._pending_pairing_checked = True
             return await self.async_step_credentials()
         return self.async_show_form(
@@ -535,7 +489,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                 await self._async_clear_pending_pairing()
             except Exception:  # noqa: BLE001
                 _log_error("Could not reset invalid pending pairing state")
-                return self.async_abort(reason="pending_storage_failed")
+                return self._abort_with_report("pending_storage_failed")
             self._pending_pairing_checked = True
             return await self.async_step_credentials()
         return self.async_show_form(
@@ -543,8 +497,43 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             data_schema=vol.Schema({}),
         )
 
-    def _do_pairing_setup(self) -> None:
-        """Synchronous helper for the portal-side setup steps."""
+    def _pairing_report(self) -> PairingReport:
+        """Return the debug report shared by every pairing stage of this flow."""
+        if self._report is None:
+            self._report = PairingReport(
+                (_LOGGER, get_redacting_logger(f"{__package__}.portal")),
+                f"Home Assistant {HA_VERSION}, profile {self._gateway_profile}",
+            )
+        return self._report
+
+    def _debug_report(self) -> str:
+        """Return the rendered debug report placeholder value."""
+        return self._pairing_report().render()
+
+    def _abort_with_report(self, reason: str) -> ConfigFlowResult:
+        """Abort and keep the collected debug report visible."""
+        return self.async_abort(
+            reason=reason,
+            description_placeholders={"debug_report": self._debug_report()},
+        )
+
+    def _log_stage_failure(self, err: Exception) -> None:
+        """Record why a pairing stage failed for the debug report."""
+        _LOGGER.warning(
+            _LOG_PREFIX + "Pairing stage %s failed: %s: %s",
+            self._pairing_stage,
+            type(err).__name__,
+            err,
+        )
+
+    def _set_pairing_stage(self, stage: str) -> None:
+        """Show the next pairing stage in the progress dialog."""
+        self._pairing_stage = stage
+        _log_info("Pairing stage: %s", stage)
+        self.async_notify_flow_changed()
+
+    def _resolve_gateway_uuid(self) -> None:
+        """Determine the gateway UUID before the portal registers a client."""
         capabilities = GATEWAY_CAPABILITIES[self._gateway_profile]
 
         # Get the gateway UUID from the gateway itself — the portal's
@@ -565,28 +554,34 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             self._gateway_uuid = gw_info["uuid"]
             self._gateway_name = gw_info.get("portalname") or "ABB Welcome Gateway"
 
+    def _ensure_portal_identity(self) -> None:
+        """Request a portal certificate unless this flow already holds one."""
         # Retrying after a later failure keeps the identity already issued in
         # this flow so the portal does not collect orphaned clients.
-        if not self._cert_pem or self._cert_username != self._username:
-            self._client_name = default_client_name()
-            priv_pem, csr_pem, _ = generate_keypair_and_csr(self._username)
+        if self._cert_pem and self._cert_username == self._username:
+            _log_info("Reusing the portal certificate issued earlier in this flow")
+            return
+        self._client_name = default_client_name()
+        priv_pem, csr_pem, _ = generate_keypair_and_csr(self._username)
 
-            self._portal_url = resolve_portal_url(self._username)
-            self._cert_pem = request_certificate(
-                self._portal_url,
-                self._username,
-                self._password,
-                csr_pem,
-                self._client_name,
-            )
-            self._private_key_pem = priv_pem
-            self._cert_username = self._username
+        self._portal_url = resolve_portal_url(self._username)
+        self._cert_pem = request_certificate(
+            self._portal_url,
+            self._username,
+            self._password,
+            csr_pem,
+            self._client_name,
+        )
+        self._private_key_pem = priv_pem
+        self._cert_username = self._username
 
-            identity = derive_identity(self._cert_pem, self._username)
-            self._sip_username = identity["sip_username"]
-            self._fingerprint = identity["fingerprint_sha1"]
-            self._own_uuid = identity["own_portal_uuid"]
+        identity = derive_identity(self._cert_pem, self._username)
+        self._sip_username = identity["sip_username"]
+        self._fingerprint = identity["fingerprint_sha1"]
+        self._own_uuid = identity["own_portal_uuid"]
 
+    def _send_connect_request(self) -> None:
+        """Ask the gateway, through the portal, to list our pairing request."""
         self._integrity_eight, self._integrity_display = compute_integrity_code(
             self._fingerprint
         )
@@ -608,6 +603,102 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             self._integrity_eight,
         )
 
+    async def async_step_pairing(
+        self, user_input: dict | None = None
+    ) -> ConfigFlowResult:
+        """Run portal setup and gateway approval with visible progress."""
+        if self._pairing_task is None:
+            self._pairing_stage = "gateway_uuid"
+            self._pairing_task = self.hass.async_create_task(
+                self._async_run_pairing()
+            )
+        if not self._pairing_task.done():
+            return self.async_show_progress(
+                step_id="pairing",
+                progress_action=f"pairing_{self._pairing_stage}",
+                progress_task=self._pairing_task,
+            )
+        task, self._pairing_task = self._pairing_task, None
+        return self.async_show_progress_done(next_step_id=task.result())
+
+    async def _async_run_pairing(self) -> str:
+        """Pair with the portal and gateway; return the next step id."""
+        with self._pairing_report().capture():
+            return await self._async_pairing_stages()
+
+    def _pairing_failed(self, error: str) -> str:
+        """Return to the credentials form with an error and the report."""
+        self._pairing_errors = {"base": error}
+        return "credentials"
+
+    async def _async_pairing_stages(self) -> str:
+        capabilities = GATEWAY_CAPABILITIES[self._gateway_profile]
+        # Phase 1: portal-side setup + send connect event to gateway.
+        # Errors here are unrecoverable (we never put a pending request on
+        # the gateway), so they go straight back to the form.
+        try:
+            self._set_pairing_stage("gateway_uuid")
+            await self.hass.async_add_executor_job(self._resolve_gateway_uuid)
+            self._set_pairing_stage("certificate")
+            await self.hass.async_add_executor_job(self._ensure_portal_identity)
+            self._set_pairing_stage("connect")
+            await self.hass.async_add_executor_job(self._send_connect_request)
+        except GatewayAdminError as err:
+            msg = str(err).lower()
+            self._log_stage_failure(err)
+            if "login failed" in msg:
+                return self._pairing_failed("gateway_admin_auth_failed")
+            if "missing uuid" in msg or "op=6" in msg:
+                # Local op=6 lookup failed and user didn't supply an override.
+                # Tell them how to recover.
+                return self._pairing_failed("gateway_op6_failed")
+            return self._pairing_failed("gateway_admin_failed")
+        except PortalError as err:
+            msg = str(err).lower()
+            self._log_stage_failure(err)
+            if "401" in msg or "auth" in msg:
+                return self._pairing_failed("invalid_auth")
+            if "no discovery" in msg or "gateway entry" in msg:
+                return self._pairing_failed("gateway_not_found")
+            return self._pairing_failed("unknown")
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Unexpected portal setup error")
+            return self._pairing_failed("unknown")
+
+        if capabilities.approval_method == "automatic_acl":
+            try:
+                await self._async_save_pending_pairing()
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Could not persist pending pairing state")
+                self._abort_reason = "pending_storage_failed"
+                return "pairing_failed"
+            return "poll_acl"
+
+        # Phase 2: auto-approve on the gateway. By this point the connect
+        # event was successfully sent, so the gateway has a pending request —
+        # recoverable via the manual UI even if our CGI calls fail.
+        try:
+            self._set_pairing_stage("approve")
+            await self.hass.async_add_executor_job(self._do_gateway_authorize)
+        except GatewayAdminError as err:
+            self._log_stage_failure(err)
+            if "login failed" in str(err).lower():
+                # Wrong admin password — manual flow can't recover.
+                return self._pairing_failed("gateway_admin_auth_failed")
+            _log_info("Offering manual approval via the gateway web UI")
+            self._manual_authorize = True
+            return "manual_authorize"
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Unexpected error during auto-approve")
+            return self._pairing_failed("unknown")
+        return "poll_acl"
+
+    async def async_step_pairing_failed(
+        self, user_input: dict | None = None
+    ) -> ConfigFlowResult:
+        """Abort after a background pairing stage could not continue."""
+        return self._abort_with_report(self._abort_reason)
+
     async def async_step_manual_authorize(
         self, user_input: dict | None = None
     ) -> ConfigFlowResult:
@@ -627,7 +718,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                 "gateway_ip": self._gateway_ip,
                 "client_name": self._client_name,
                 "integrity_code": self._integrity_display,
-                "error_detail": self._authorize_error_msg or "(no details)",
+                "debug_report": self._debug_report(),
             },
         )
 
@@ -646,14 +737,54 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             description_placeholders={
                 "client_name": self._client_name,
                 "integrity_code": self._integrity_display,
+                "debug_report": (
+                    self._debug_report() if self._acl_timed_out else ""
+                ),
             },
         )
+
+    def _poll_attempts(self) -> int:
+        return POLL_ATTEMPTS_MANUAL if self._manual_authorize else POLL_ATTEMPTS
 
     async def async_step_poll_acl(
         self, user_input: dict | None = None
     ) -> ConfigFlowResult:
-        """Poll for the ACL update produced by pairing."""
-        attempts = POLL_ATTEMPTS_MANUAL if self._manual_authorize else POLL_ATTEMPTS
+        """Wait for the ACL update produced by pairing, showing each check."""
+        if self._poll_task is None:
+            self._poll_attempt = 0
+            self._poll_task = self.hass.async_create_task(self._async_run_poll_acl())
+        if not self._poll_task.done():
+            return self.async_show_progress(
+                step_id="poll_acl",
+                progress_action="poll_acl",
+                description_placeholders={
+                    "attempt": str(self._poll_attempt),
+                    "attempts": str(self._poll_attempts()),
+                    "client_name": self._client_name,
+                    "integrity_code": self._integrity_display,
+                },
+                progress_task=self._poll_task,
+            )
+        task, self._poll_task = self._poll_task, None
+        return self.async_show_progress_done(next_step_id=task.result())
+
+    def _poll_attempt_started(self, attempt: int) -> None:
+        """Receive poll attempts from the executor thread."""
+        self.hass.loop.call_soon_threadsafe(self._show_poll_attempt, attempt)
+
+    def _show_poll_attempt(self, attempt: int) -> None:
+        if self._poll_task is None or self._poll_task.done():
+            return
+        self._poll_attempt = attempt
+        self.async_update_progress(attempt / self._poll_attempts())
+        self.async_notify_flow_changed()
+
+    async def _async_run_poll_acl(self) -> str:
+        """Poll for the ACL update; return the next step id."""
+        with self._pairing_report().capture():
+            return await self._async_poll_acl_stages()
+
+    async def _async_poll_acl_stages(self) -> str:
         try:
             payload = await self.hass.async_add_executor_job(
                 poll_acl_update,
@@ -661,19 +792,26 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                 self._cert_pem,
                 self._private_key_pem,
                 self._own_uuid,
-                attempts,
+                self._poll_attempts(),
                 POLL_INTERVAL,
+                self._poll_attempt_started,
             )
         except Exception:  # noqa: BLE001
-            _LOGGER.error("ACL polling error (details redacted)")
-            return self.async_abort(reason="unknown")
+            _LOGGER.exception("ACL polling error")
+            self._abort_reason = "unknown"
+            return "pairing_failed"
 
         if not payload:
+            _LOGGER.warning(
+                _LOG_PREFIX + "No ACL update arrived after %d checks",
+                self._poll_attempts(),
+            )
             capabilities = GATEWAY_CAPABILITIES[self._gateway_profile]
             if capabilities.approval_method == "automatic_acl":
                 self._acl_timed_out = True
-                return await self.async_step_app_authorize()
-            return self.async_abort(reason="acl_timeout")
+                return "app_authorize"
+            self._abort_reason = "acl_timeout"
+            return "pairing_failed"
 
         try:
             (
@@ -683,9 +821,11 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             ) = await self.hass.async_add_executor_job(
                 parse_acl_update, payload, self._private_key_pem
             )
-        except PortalError:
-            _log_error("ACL parse failed (details redacted)")
-            return self.async_abort(reason="acl_parse_failed")
+        except PortalError as err:
+            # Parse errors can quote ACL content, so only the type is logged.
+            _log_error("ACL parse failed (%s)", type(err).__name__)
+            self._abort_reason = "acl_parse_failed"
+            return "pairing_failed"
 
         self._sip_password = sip_password
         self._sip_domain = sip_domain
@@ -714,11 +854,16 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             try:
                 await self._async_save_pending_pairing()
             except Exception:  # noqa: BLE001
-                _log_error(
-                    "Could not persist completed ACL pairing state (details redacted)"
-                )
-                return self.async_abort(reason="pending_storage_failed")
+                _LOGGER.exception("Could not persist completed ACL pairing state")
+                self._abort_reason = "pending_storage_failed"
+                return "pairing_failed"
 
+        return "acl_received"
+
+    async def async_step_acl_received(
+        self, user_input: dict | None = None
+    ) -> ConfigFlowResult:
+        """Check for an existing entry before confirming the pairing."""
         abort = await self._check_unique(self._gateway_uuid)
         if abort is not None:
             return abort
@@ -759,7 +904,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                         "Entry was prepared but pending pairing state could not be "
                         "cleared"
                     )
-                    return self.async_abort(reason="pending_storage_failed")
+                    return self._abort_with_report("pending_storage_failed")
             return result
 
         door_lines = "\n".join(
