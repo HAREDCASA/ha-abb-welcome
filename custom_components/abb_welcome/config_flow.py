@@ -172,6 +172,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
         self._portal_url = ""
         self._private_key_pem = b""
         self._cert_pem = b""
+        self._cert_username = ""
         self._client_name = ""
         self._sip_username = ""
         self._sip_password = ""
@@ -545,29 +546,14 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
     def _do_pairing_setup(self) -> None:
         """Synchronous helper for the portal-side setup steps."""
         capabilities = GATEWAY_CAPABILITIES[self._gateway_profile]
-        self._client_name = default_client_name()
-        priv_pem, csr_pem, _ = generate_keypair_and_csr(self._username)
-        self._private_key_pem = priv_pem
-
-        self._portal_url = resolve_portal_url(self._username)
-        self._cert_pem = request_certificate(
-            self._portal_url,
-            self._username,
-            self._password,
-            csr_pem,
-            self._client_name,
-        )
-
-        identity = derive_identity(self._cert_pem, self._username)
-        self._sip_username = identity["sip_username"]
-        self._fingerprint = identity["fingerprint_sha1"]
-        self._own_uuid = identity["own_portal_uuid"]
 
         # Get the gateway UUID from the gateway itself — the portal's
         # discovery event has a race for brand-new identities. If the user
         # supplied an override (some firmware revisions have a broken
         # portalclient.cgi op=6 — see GitHub issue #1), skip the local
-        # lookup entirely and trust the value they pasted in.
+        # lookup entirely and trust the value they pasted in. This runs
+        # before the certificate request because every certificate registers
+        # another client on the portal.
         if not capabilities.admin_available:
             self._gateway_uuid = self._gateway_uuid_override
             self._gateway_name = "M2240x / ASI22"
@@ -578,6 +564,28 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             gw_info = gateway_local_info(self._gateway_ip, self._gateway_password)
             self._gateway_uuid = gw_info["uuid"]
             self._gateway_name = gw_info.get("portalname") or "ABB Welcome Gateway"
+
+        # Retrying after a later failure keeps the identity already issued in
+        # this flow so the portal does not collect orphaned clients.
+        if not self._cert_pem or self._cert_username != self._username:
+            self._client_name = default_client_name()
+            priv_pem, csr_pem, _ = generate_keypair_and_csr(self._username)
+
+            self._portal_url = resolve_portal_url(self._username)
+            self._cert_pem = request_certificate(
+                self._portal_url,
+                self._username,
+                self._password,
+                csr_pem,
+                self._client_name,
+            )
+            self._private_key_pem = priv_pem
+            self._cert_username = self._username
+
+            identity = derive_identity(self._cert_pem, self._username)
+            self._sip_username = identity["sip_username"]
+            self._fingerprint = identity["fingerprint_sha1"]
+            self._own_uuid = identity["own_portal_uuid"]
 
         self._integrity_eight, self._integrity_display = compute_integrity_code(
             self._fingerprint

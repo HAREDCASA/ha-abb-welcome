@@ -584,6 +584,145 @@ def test_web_admin_pairing_keeps_local_uuid_cgi_path() -> None:
     assert flow._gateway_name == "Test Gateway"
 
 
+def _stub_web_admin_pairing(module, calls):
+    names = iter(("ha-first", "ha-second", "ha-third"))
+    module.default_client_name = lambda: next(names)
+    module._gateway_port_reachable = lambda *_args: True
+    module.generate_keypair_and_csr = lambda username: (b"key", b"csr", object())
+    module.resolve_portal_url = lambda username: "https://portal.invalid"
+
+    def _certificate(_url, username, *_args):
+        calls["certificate"].append(username)
+        return f"cert-{len(calls['certificate'])}".encode()
+
+    def _connect(_url, cert, _key, gateway_uuid, *_args):
+        calls["connect"].append((cert, gateway_uuid))
+
+    module.request_certificate = _certificate
+    module.derive_identity = lambda cert, username: {
+        "sip_username": f"{username}_sip",
+        "fingerprint_sha1": "A" * 40,
+        "own_portal_uuid": "11111111-1111-4111-8111-111111111111",
+    }
+    module.compute_integrity_code = lambda fingerprint: ("1234ABCD", "1234 ABCD")
+    module.send_connect_event = _connect
+    module.poll_acl_update = lambda *args: None
+
+
+def _web_admin_credentials(module, username="portal-user", uuid=""):
+    return {
+        module.CONF_ABB_USERNAME: username,
+        module.CONF_ABB_PASSWORD: "portal-password",
+        module.CONF_GATEWAY_IP: "192.0.2.10",
+        module.CONF_GATEWAY_PASSWORD: "admin-password",
+        module.CONF_GATEWAY_UUID_OVERRIDE: uuid,
+    }
+
+
+def test_web_admin_uuid_lookup_failure_does_not_register_portal_client() -> None:
+    module = _load_config_flow()
+    flow = module.ABBWelcomeConfigFlow()
+    flow.hass = _FakeHass()
+    flow._gateway_profile = module.GATEWAY_PROFILES[0]
+    calls = {"certificate": [], "connect": []}
+    _stub_web_admin_pairing(module, calls)
+
+    def _empty_op6(*args):
+        raise module.GatewayAdminError("Gateway op=6 response missing uuid: {}")
+
+    module.gateway_local_info = _empty_op6
+    module.gateway_authorize = lambda *args: "user_7"
+
+    failed = asyncio.run(
+        flow.async_step_credentials(_web_admin_credentials(module))
+    )
+    assert failed["errors"]["base"] == "gateway_op6_failed"
+    assert calls == {"certificate": [], "connect": []}
+
+    uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    asyncio.run(
+        flow.async_step_credentials(_web_admin_credentials(module, uuid=uuid))
+    )
+    assert calls == {"certificate": ["portal-user"], "connect": [(b"cert-1", uuid)]}
+
+
+def test_web_admin_retry_after_connect_reuses_issued_certificate() -> None:
+    module = _load_config_flow()
+    flow = module.ABBWelcomeConfigFlow()
+    flow.hass = _FakeHass()
+    flow._gateway_profile = module.GATEWAY_PROFILES[0]
+    calls = {"certificate": [], "connect": []}
+    _stub_web_admin_pairing(module, calls)
+    uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    module.gateway_local_info = lambda *args: {"uuid": uuid}
+    authorize_names = []
+
+    def _authorize(_ip, password, client_name, _code):
+        authorize_names.append(client_name)
+        if password == "admin-password":
+            raise module.GatewayAdminError("Gateway login failed (HTTP 200)")
+        return "user_7"
+
+    module.gateway_authorize = _authorize
+
+    failed = asyncio.run(
+        flow.async_step_credentials(_web_admin_credentials(module))
+    )
+    assert failed["errors"]["base"] == "gateway_admin_auth_failed"
+
+    retry = _web_admin_credentials(module)
+    retry[module.CONF_GATEWAY_PASSWORD] = "corrected-admin-password"
+    asyncio.run(flow.async_step_credentials(retry))
+    assert calls["certificate"] == ["portal-user"]
+    assert calls["connect"] == [(b"cert-1", uuid), (b"cert-1", uuid)]
+    assert authorize_names == ["ha-first", "ha-first"]
+
+    # A different portal account cannot reuse the first account's identity.
+    asyncio.run(
+        flow.async_step_credentials(
+            _web_admin_credentials(module, username="other-user")
+        )
+    )
+    assert calls["certificate"] == ["portal-user", "other-user"]
+    assert calls["connect"][-1] == (b"cert-2", uuid)
+
+
+def test_failed_certificate_request_keeps_issued_key_pair() -> None:
+    module = _load_config_flow()
+    flow = module.ABBWelcomeConfigFlow()
+    flow.hass = _FakeHass()
+    flow._gateway_profile = module.GATEWAY_PROFILES[0]
+    calls = {"certificate": [], "connect": []}
+    _stub_web_admin_pairing(module, calls)
+    module.generate_keypair_and_csr = lambda username: (
+        f"key-{username}".encode(), b"csr", object()
+    )
+    uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    module.gateway_local_info = lambda *args: {"uuid": uuid}
+    module.gateway_authorize = lambda *args: (_ for _ in ()).throw(
+        module.GatewayAdminError("Gateway login failed (HTTP 200)")
+    )
+    asyncio.run(flow.async_step_credentials(_web_admin_credentials(module)))
+    assert (flow._cert_pem, flow._private_key_pem) == (b"cert-1", b"key-portal-user")
+
+    issue = module.request_certificate
+    module.request_certificate = lambda *args: (_ for _ in ()).throw(
+        module.PortalError("Portal authentication failed (HTTP 401)")
+    )
+    rejected = asyncio.run(
+        flow.async_step_credentials(
+            _web_admin_credentials(module, username="wrong-user")
+        )
+    )
+    assert rejected["errors"]["base"] == "invalid_auth"
+    assert (flow._cert_pem, flow._private_key_pem) == (b"cert-1", b"key-portal-user")
+
+    module.request_certificate = issue
+    asyncio.run(flow.async_step_credentials(_web_admin_credentials(module)))
+    assert calls["certificate"] == ["portal-user"]
+    assert flow._private_key_pem == b"key-portal-user"
+
+
 def test_acl_parsing_builds_doors_before_confirmation() -> None:
     module = _load_config_flow()
     flow = module.ABBWelcomeConfigFlow()
