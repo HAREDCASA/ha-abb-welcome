@@ -378,6 +378,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             async_track_time_interval(hass, _poll_events, POLL_INTERVAL)
         )
 
+    entry.async_on_unload(coordinator.async_stop_ring_poll)
+
     # Realtime SIP listener for ring detection.  Set up only when SIP
     # credentials are present (config entries from older flows may not have
     # them; in that case we silently skip the listener and the integration
@@ -411,6 +413,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             sensor = entry_data.get("ringing_sensor")
             if sensor is not None:
                 sensor.trigger_ring(payload)
+            coordinator.async_schedule_ring_poll()
             if is_pickup_allowed(hass, entry.entry_id):
                 # Auto-arm streaming so the user can answer the ring within
                 # the next minute (clicking the camera or accepting a HomeKit

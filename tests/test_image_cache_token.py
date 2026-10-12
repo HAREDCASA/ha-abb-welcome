@@ -124,6 +124,9 @@ def test_new_screenshot_changes_entity_picture_url_immediately() -> None:
     assert first_url != initial_url
     assert second_url != first_url
     assert asyncio.run(entity.async_image()) == b"second"
+    assert entity.extra_state_attributes["captured_at"] == (
+        "2026-08-25T12:01:00+00:00"
+    )
 
 
 def test_same_screenshot_does_not_rotate_token_again() -> None:

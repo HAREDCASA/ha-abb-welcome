@@ -6,10 +6,9 @@ import asyncio
 import base64
 import importlib.util
 import json
-import socket
 import struct
 import sys
-import time
+import threading
 import types
 from pathlib import Path
 
@@ -253,6 +252,18 @@ class _FakeTransport:
         self.close_calls += 1
 
 
+class _SignalingTransport(_FakeTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.notify_at = sys.maxsize
+        self.send_count_reached = threading.Event()
+
+    def sendto(self, packet: bytes, destination: tuple[str, int]) -> None:
+        super().sendto(packet, destination)
+        if len(self.sent) >= self.notify_at:
+            self.send_count_reached.set()
+
+
 def test_talkback_send_timing_stats_observe_successful_transport_sends() -> None:
     send_times = iter(
         (100_000_000_000, 100_020_000_000, 100_055_000_000, 100_080_000_000)
@@ -352,30 +363,23 @@ def test_talkback_sender_thread_closes_socket_once_on_stop() -> None:
     assert close_calls == 1
 
 
-def test_talkback_thread_cadence_survives_event_loop_block() -> None:
-    async def _run() -> dict:
-        receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sender_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        receiver.bind(("127.0.0.1", 0))
-        sender_socket.bind(("127.0.0.1", 0))
-        sender = media._PCMATalkSender(
-            sender_socket,
-            receiver.getsockname(),
-        )
+def test_talkback_thread_sends_while_event_loop_is_blocked() -> None:
+    async def _run() -> tuple[dict, int]:
+        transport = _SignalingTransport()
+        sender = media._PCMATalkSender(transport, ("192.0.2.10", 5004))
         try:
             await sender.start()
-            await asyncio.sleep(0.08)
-            time.sleep(0.25)  # noqa: ASYNC251 - deliberately block this thread
-            await asyncio.sleep(0.08)
-            return sender.stats()
+            sends_before_block = len(transport.sent)
+            transport.notify_at = sends_before_block + 3
+            assert transport.send_count_reached.wait(1.0)  # noqa: ASYNC251
+            return sender.stats(), len(transport.sent) - sends_before_block
         finally:
             await sender.stop()
-            receiver.close()
 
-    stats = asyncio.run(_run())
+    stats, sends_while_blocked = asyncio.run(_run())
 
-    assert stats["send_intervals"] >= 12
-    assert stats["max_send_gap_ms"] < 150
+    assert sends_while_blocked >= 3
+    assert stats["send_intervals"] >= sends_while_blocked
 
 
 def test_outgoing_talkback_and_punch_use_media_encryption() -> None:

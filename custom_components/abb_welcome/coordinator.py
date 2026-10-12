@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import http.client
 import json
+import socket
+import ssl
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -39,6 +43,7 @@ POLL_INTERVAL_SECONDS = 30
 HISTORY_PAGE_SIZE = 20
 HISTORY_EVENT_CAP = 200
 SCREENSHOT_HISTORY_TYPE = "com.abb.ispf.event.welcome.screenshot"
+RING_EVENT_POLL_DELAYS = (2.0, 5.0, 10.0, 20.0)
 
 
 @dataclass
@@ -87,7 +92,7 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
         )
         self._cert_pem: bytes = entry.data.get("certificate_pem", "").encode()
         self._key_pem: bytes = entry.data.get("private_key_pem", "").encode()
-        self._newest_id: str = ""
+        self._ring_poll_task: asyncio.Task[None] | None = None
         self._screenshot_history_checked = False
         self._portal_url = str(
             entry.data.get("portal_url", DEFAULT_PORTAL_URL) or DEFAULT_PORTAL_URL
@@ -165,6 +170,52 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
     def has_certs(self) -> bool:
         return self._has_certs
 
+    def async_schedule_ring_poll(self) -> None:
+        """Start one bounded portal-poll sequence for the latest SIP ring."""
+        if not self._has_certs:
+            return
+        if self._ring_poll_task is not None and not self._ring_poll_task.done():
+            self._ring_poll_task.cancel()
+        previous_id = self._data.latest_screenshot_event_id
+        self._ring_poll_task = self.hass.async_create_background_task(
+            self._async_poll_for_new_screenshot(previous_id),
+            name="abb_welcome_ring_event_poll",
+        )
+
+    async def _async_poll_for_new_screenshot(self, previous_id: str) -> None:
+        """Refresh briefly after a ring, stopping once its screenshot arrives."""
+        current_task = asyncio.current_task()
+        elapsed = 0.0
+        try:
+            for delay in RING_EVENT_POLL_DELAYS:
+                await asyncio.sleep(max(0.0, delay - elapsed))
+                elapsed = delay
+                if self._data.latest_screenshot_event_id != previous_id:
+                    return
+                await self.async_request_refresh()
+                if self._data.latest_screenshot_event_id != previous_id:
+                    _LOGGER.info(
+                        _LOG + "Ring-triggered poll found a new screenshot after %.0fs",
+                        elapsed,
+                    )
+                    return
+        finally:
+            if self._ring_poll_task is current_task:
+                self._ring_poll_task = None
+
+    async def async_stop_ring_poll(self) -> None:
+        """Cancel the ring-triggered portal poll during config-entry unload."""
+        task = self._ring_poll_task
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        if self._ring_poll_task is task:
+            self._ring_poll_task = None
+
     def _make_session(self) -> tuple[requests.Session, list[str]]:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         ct = tempfile.NamedTemporaryFile(suffix=".pem", delete=False)
@@ -210,6 +261,113 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
             raise TypeError("Unexpected portal events value")
         return [event for event in events if isinstance(event, dict)]
 
+    @staticmethod
+    def _nested_exceptions(error: BaseException) -> tuple[BaseException, ...]:
+        """Return a bounded exception chain without reading message text."""
+        found: list[BaseException] = []
+        pending = [error]
+        seen: set[int] = set()
+        while pending and len(found) < 12:
+            current = pending.pop(0)
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            found.append(current)
+            nested = (
+                current.__cause__,
+                current.__context__,
+                getattr(current, "reason", None),
+                *current.args,
+            )
+            pending.extend(
+                item for item in nested if isinstance(item, BaseException)
+            )
+        return tuple(found)
+
+    @classmethod
+    def _connection_failure_kind(cls, error: BaseException) -> str:
+        """Classify a connection failure using exception types only."""
+        chain = cls._nested_exceptions(error)
+        if any(
+            isinstance(
+                item,
+                (
+                    requests.exceptions.SSLError,
+                    urllib3.exceptions.SSLError,
+                    ssl.CertificateError,
+                    ssl.SSLError,
+                ),
+            )
+            for item in chain
+        ):
+            return "tls"
+        if any(
+            isinstance(item, socket.gaierror)
+            or (
+                type(item).__module__.startswith("urllib3")
+                and type(item).__name__ == "NameResolutionError"
+            )
+            for item in chain
+        ):
+            return "dns"
+        if any(isinstance(item, http.client.RemoteDisconnected) for item in chain):
+            return "remote-close"
+        if any(isinstance(item, ConnectionResetError) for item in chain):
+            return "reset"
+        if any(isinstance(item, ConnectionRefusedError) for item in chain):
+            return "refused"
+        if any(isinstance(item, BrokenPipeError) for item in chain):
+            return "broken-pipe"
+        if any(
+            isinstance(
+                item,
+                (
+                    TimeoutError,
+                    urllib3.exceptions.ConnectTimeoutError,
+                    urllib3.exceptions.ReadTimeoutError,
+                ),
+            )
+            for item in chain
+        ):
+            return "timeout"
+        if any(
+            isinstance(item, urllib3.exceptions.NewConnectionError)
+            for item in chain
+        ):
+            return "new-connection"
+        if any(isinstance(item, urllib3.exceptions.ProtocolError) for item in chain):
+            return "protocol"
+        if any(isinstance(item, urllib3.exceptions.MaxRetryError) for item in chain):
+            return "max-retries"
+        return "connection"
+
+    @classmethod
+    def _request_failure_details(
+        cls,
+        error: requests.RequestException,
+    ) -> tuple[str, int | str]:
+        """Return diagnostics that cannot expose portal response content."""
+        if isinstance(error, requests.exceptions.SSLError):
+            kind = "tls"
+        elif isinstance(error, requests.exceptions.ProxyError):
+            kind = "proxy"
+        elif isinstance(error, requests.exceptions.ConnectTimeout):
+            kind = "connect-timeout"
+        elif isinstance(error, requests.exceptions.ReadTimeout):
+            kind = "read-timeout"
+        elif isinstance(error, requests.Timeout):
+            kind = "timeout"
+        elif isinstance(error, requests.ConnectionError):
+            kind = cls._connection_failure_kind(error)
+        elif isinstance(error, requests.HTTPError):
+            kind = "http"
+        else:
+            kind = "request"
+
+        response = getattr(error, "response", None)
+        status = getattr(response, "status_code", None)
+        return kind, status if isinstance(status, int) else "none"
+
     def _fetch_latest_historical_screenshot(
         self,
         session: requests.Session,
@@ -254,8 +412,6 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
                 "pagination_limit": HISTORY_PAGE_SIZE,
                 "pagination_page": 1,
             }
-            if self._newest_id:
-                params["newer_than_id"] = self._newest_id
 
             response = session.get(
                 f"{self._portal_url}/event", params=params, timeout=15
@@ -284,7 +440,7 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
             if not raw_events:
                 return self._data
 
-            new_events: list[IntercomEvent] = []
+            polled_events: list[IntercomEvent] = []
             newest_screenshot: bytes | None = None
             newest_screenshot_id = ""
 
@@ -328,10 +484,10 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
                 if ie.station_id and not ie.local_name:
                     ie.local_name = self._station_names.get(ie.station_id, "")
 
-                new_events.append(ie)
+                polled_events.append(ie)
 
-            station_match_events = new_events + self._data.events
-            for ie in new_events:
+            station_match_events = polled_events + self._data.events
+            for ie in polled_events:
                 if not ie.image_data:
                     continue
                 station_event = self._station_event_for_screenshot(
@@ -345,16 +501,11 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
                     ie.station_id, ""
                 )
 
-            # The mixed-history page remains the sole incremental polling
-            # anchor.  A historical screenshot must never move this backward.
-            if normal_events:
-                first_id = normal_events[0].get("id", "")
-                if first_id:
-                    self._newest_id = first_id
-
-            # Prepend new events to the existing newest-first list, removing
+            # Prepend polled events to the existing newest-first list, removing
             # portal page overlap before applying the retained history cap.
-            merged_events = self._deduplicate_events(new_events + self._data.events)
+            merged_events = self._deduplicate_events(
+                polled_events + self._data.events
+            )
             merged_events.sort(
                 key=lambda event: (
                     self._timestamp_seconds(event.timestamp) is not None,
@@ -368,25 +519,30 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
                 self._data.latest_screenshot = newest_screenshot
                 self._data.latest_screenshot_event_id = newest_screenshot_id
 
-            for ie in new_events:
+            for ie in polled_events:
                 if ie.image_data and ie.station_id:
                     self._data.latest_screenshots_by_station[ie.station_id] = ie
 
             # Latest non-screenshot event for the sensor
-            for ie in new_events:
+            for ie in polled_events:
                 if ie.event_type != "screenshot":
                     self._data.last_event = ie
                     break
 
             _LOGGER.info(
-                _LOG + "Polled %d new events (%d screenshots)",
-                len(new_events),
-                sum(1 for e in new_events if e.image_data),
+                _LOG + "Polled %d events (%d screenshots)",
+                len(polled_events),
+                sum(1 for event in polled_events if event.image_data),
             )
             return self._data
 
         except requests.RequestException as err:
-            _LOGGER.warning(_LOG + "Event poll failed: %s", err)
+            kind, status = self._request_failure_details(err)
+            _LOGGER.warning(
+                _LOG + "Portal history poll failed (kind=%s, status=%s)",
+                kind,
+                status,
+            )
             return self._data
         finally:
             session.close()
