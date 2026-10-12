@@ -106,12 +106,16 @@ admin Portal page or ABB Welcome mobile app, then retry.
 
 Both profiles:
 
-1. Generates a fresh RSA keypair and requests a client certificate from the
-   MyBuildings portal.
-2. Computes the gateway integrity code from the certificate fingerprint.
-3. Sends one `welcome.connect` event so the device sees a pending pairing.
-4. Polls for the gateway ACL update, decrypts the SIP password, reads the door
-   list, and creates HA entities.
+1. Determine the gateway UUID before anything is registered on MyBuildings.
+2. Generate a fresh RSA keypair and request a client certificate from the
+   MyBuildings portal. Each certificate appears as an `ha-*` client, so a retry
+   in the same setup dialog with the same portal account reuses it.
+3. Compute the gateway integrity code from the certificate fingerprint.
+4. Send one `welcome.connect` event so the device sees a pending pairing.
+5. Poll for the gateway ACL update, decrypt the SIP password, read the door
+   list, and create HA entities.
+
+The setup dialog shows which stage is running and counts the ACL checks.
 
 For a web-admin gateway, setup reads the gateway UUID from its CGI (unless an
 override was supplied), then logs into the CGI to approve the pending client.
@@ -492,6 +496,9 @@ falls back to Standard; another door is never selected silently.
   page disappears, start ABB Welcome setup again and choose the app-managed
   profile; Home Assistant offers to resume the saved request without sending
   another `welcome.connect`.
+- **Any setup failure**: the error page ends with a **Debug report** box holding
+  the setup's DEBUG log with passwords, IPs, UUIDs and certificates redacted.
+  Copy the whole box into a GitHub issue.
 - **Invalid portal credentials**: the MyBuildings portal rejected the username or
   password.
 - **Gateway admin password is wrong**: log into `https://<gateway-ip>/` manually

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import logging
 import re
 import sys
@@ -992,7 +993,8 @@ def test_pairing_failure_shows_redacted_debug_report() -> None:
     assert flow.suggested_values == _web_admin_credentials(module)
     report = result["description_placeholders"]["debug_report"]
     assert report.startswith("\n\n**Debug report**")
-    assert "ABB Welcome 1.7.0-dev2, Home Assistant 2099.1.0, profile web_admin" in report
+    version = json.loads((_PKG_DIR / "manifest.json").read_text())["version"]
+    assert f"ABB Welcome {version}, Home Assistant 2099.1.0, profile web_admin" in report
     assert re.search(
         r"\n\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} DEBUG abb_pairing_test.portal: "
         r"\[abb\] op=6 probe for <redacted> returned 0 bytes\n",
