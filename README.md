@@ -317,11 +317,16 @@ are mainly intended for the Scrypted plugin.
 - `abb_welcome.talk_stop`
 - `abb_welcome.talk_pcm16le`
 - `abb_welcome.talk_tone`
+- `abb_welcome.talk_audio_file`
 
 The audio format for `talk_pcm16le` is base64-encoded 8 kHz mono signed 16-bit
 little-endian PCM. HA converts it to continuous PCMA/G.711 A-law RTP on the
 active call's audio leg. Idle talkback sends silence continuously, and voice
 frames are queued into the same RTP sequence.
+
+`talk_audio_file` broadcasts a local WAV or raw PCM audio file (8 kHz mono 16-bit)
+directly to the outdoor station loudspeaker, ideal for absence announcements or
+answering machine messages.
 
 Scrypted assigns a per-client `talkback_session_id` so stale clients cannot stop
 or overwrite a newer microphone session.
@@ -366,6 +371,8 @@ uses that event to refresh its station list and RTSP URLs.
   silence.
 - `abb_welcome.talk_pcm16le` - queue base64 PCM16LE microphone audio.
 - `abb_welcome.talk_tone` - send a short generated tone for testing.
+- `abb_welcome.talk_audio_file` - broadcast a local audio file (WAV or 8 kHz mono
+  16-bit PCM) through the outdoor station loudspeaker.
 - `abb_welcome.export_credentials` - export stored SIP/gateway credentials to a
   JSON file for local debugging. This output contains secrets.
 - `abb_welcome.diagnose_messages` - temporarily publish sanitized inbound SIP
@@ -520,6 +527,11 @@ falls back to Standard; another door is never selected silently.
   Rebroadcast/Prebuffer disabled for ABB doorbells.
 - **Scrypted cannot load stream after HA reload**: click **Refresh Discovery** in
   the Scrypted plugin, or check the camera `lan_rtsp_url` attribute.
+- **WebRTC live stream works on local Wi-Fi but hangs or fails on mobile data (5G/4G)**:
+  Mobile network carriers implement Carrier-Grade NAT (CGNAT) with symmetric NAT,
+  which prevents direct STUN peer-to-peer negotiation. Configure an ICE TURN relay
+  server (such as `coturn`) in `go2rtc.yaml` under `webrtc: ice_servers:` or in
+  Home Assistant network settings to allow media packets to relay smoothly.
 
 ## Tested Hardware
 
