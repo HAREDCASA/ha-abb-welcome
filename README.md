@@ -490,6 +490,70 @@ opens by default and select that exact door in Configure. If the selected
 station disappears after re-pairing or topology changes, every Hybrid unlock
 falls back to Standard; another door is never selected silently.
 
+## Example Intercom Dashboard & Automations
+
+To help users build a complete, intuitive video intercom UI in Home Assistant, here is an example implementation using conditional cards for standby vs active calls, paired with the `talk_audio_file` service.
+
+<p align="center">
+  <img src="docs/images/intercom_standby_dashboard.png" width="45%" alt="ABB Welcome Standby Dashboard" />
+  &nbsp; &nbsp;
+  <img src="docs/images/intercom_active_call_dashboard.png" width="45%" alt="ABB Welcome Active Call Dashboard" />
+</p>
+
+### Standby vs Active Call UI Flow
+* **In Standby:** Displays door unlock buttons (`Abrir Cancela`, `Abrir Urbanización`, `Abrir ABB Welcome`), direct camera view triggers, and the latest visitor screenshot with timestamp.
+* **During a Ring / Active Call:** Automatically reveals the live video feed with an active countdown timer badge (`1:51`) and an action bar with four quick-action buttons:
+  - **Abrir (Open):** Unlocks the gate (`button.press`).
+  - **Hablar (Talk):** Quick URL shortcut or talkback action.
+  - **Mensaje (Message):** Broadcasts the pre-recorded absence message through the outdoor speaker using `abb_welcome.talk_audio_file`.
+  - **Detener (Stop):** Disarms live streaming (`switch.turn_off`).
+
+### Automation: Doorbell Answering Machine (Absence Message)
+
+Broadcast an audio file to the outdoor station when someone rings the doorbell and nobody is home:
+
+```yaml
+alias: "ABB Welcome: Absence Message on Doorbell Ring"
+description: "Broadcast an absence message to the outdoor station if home is unoccupied"
+trigger:
+  - platform: state
+    entity_id: binary_sensor.red_casa_abb_welcome_gateway_intercom_ringing
+    to: "on"
+condition:
+  - condition: state
+    entity_id: group.family  # or person.your_name
+    state: "not_home"
+action:
+  - delay: "00:00:03"  # Brief pause after first ring tone
+  - action: abb_welcome.talk_audio_file
+    data:
+      file_path: "/config/www/intercom_mensaje.wav"
+```
+
+### Automation: Actionable Mobile Notification
+
+Send an instant mobile notification with the visitor screenshot and quick actions to unlock or broadcast the absence message:
+
+```yaml
+alias: "ABB Welcome: Doorbell Ring Notification"
+trigger:
+  - platform: state
+    entity_id: binary_sensor.red_casa_abb_welcome_gateway_intercom_ringing
+    to: "on"
+action:
+  - action: notify.notify
+    data:
+      title: "Doorbell Ring!"
+      message: "Someone is at the front gate."
+      data:
+        image: "/api/image_proxy/image.red_casa_abb_welcome_gateway_latest_screenshot"
+        actions:
+          - action: "OPEN_GATE"
+            title: "Open Gate"
+          - action: "SEND_MESSAGE"
+            title: "Play Absence Message"
+```
+
 ## Troubleshooting
 
 - **Cannot reach the gateway web admin on HTTPS port 443**: check the gateway IP
