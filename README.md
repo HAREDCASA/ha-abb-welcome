@@ -495,18 +495,21 @@ falls back to Standard; another door is never selected silently.
 To help users build a complete, intuitive video intercom UI in Home Assistant, here is an example implementation using conditional cards for standby vs active calls, paired with the `talk_audio_file` service.
 
 <p align="center">
-  <img src="docs/images/intercom_standby_dashboard.png" width="45%" alt="ABB Welcome Standby Dashboard" />
-  &nbsp; &nbsp;
-  <img src="docs/images/intercom_active_call_dashboard.png" width="45%" alt="ABB Welcome Active Call Dashboard" />
+  <img src="docs/images/intercom_standby_dashboard.png" width="31%" alt="ABB Welcome Standby Dashboard" />
+  &nbsp;
+  <img src="docs/images/intercom_active_call_dashboard.png" width="31%" alt="ABB Welcome Active Call Dashboard" />
+  &nbsp;
+  <img src="docs/images/intercom_technical_diagnostics_dashboard.png" width="31%" alt="ABB Welcome Technical Diagnostics Dashboard" />
 </p>
 
-### Standby vs Active Call UI Flow
+### Standby, Active Call, and Diagnostics UI Flow
 * **In Standby:** Displays door unlock buttons (`Abrir Cancela`, `Abrir Urbanización`, `Abrir ABB Welcome`), direct camera view triggers, and the latest visitor screenshot with timestamp.
 * **During a Ring / Active Call:** Automatically reveals the live video feed with an active countdown timer badge (`1:51`) and an action bar with four quick-action buttons:
   - **Abrir (Open):** Unlocks the gate (`button.press`).
   - **Hablar (Talk):** Quick URL shortcut or talkback action.
   - **Mensaje (Message):** Broadcasts the pre-recorded absence message through the outdoor speaker using `abb_welcome.talk_audio_file`.
   - **Detener (Stop):** Disarms live streaming (`switch.turn_off`).
+* **Technical & Diagnostics View:** Dedicated diagnostic panel providing per-station test actions for generated tones (`talk_tone`) and audio file messages (`talk_audio_file`), live SIP listener status monitoring, portal event refresh, and individual mobile doorbell notification toggles.
 
 ### Automation: Doorbell Answering Machine (Absence Message)
 
